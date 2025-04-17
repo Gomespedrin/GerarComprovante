@@ -1,110 +1,121 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-from flask import Flask, request, jsonify, Response, url_for
-import requests, base64
-from datetime import datetime
-from requests.exceptions import Timeout, HTTPError
+from flask import Flask, request, jsonify
+import requests
+from cachetools import TTLCache
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 app = Flask(__name__)
 
+# --- Cache em memória para o token (1 entrada, TTL=3600s = 1 hora) ---
+token_cache = TTLCache(maxsize=1, ttl=3600)
+
+# --- Sessão HTTP com retry/backoff para 502/503/504 ---
+session = requests.Session()
+retry_strategy = Retry(
+    total=3,
+    backoff_factor=1,
+    status_forcelist=[502, 503, 504],
+    allowed_methods=["GET", "POST"]
+)
+adapter = HTTPAdapter(max_retries=retry_strategy)
+session.mount("https://", adapter)
+session.mount("http://", adapter)
+
+# --- URLs externas (tire da conversa / ajuste conforme seu ambiente) ---
 TOKEN_URL = (
-    "https://grupobmg.zeev.it/api/internal/legacy/1.0/"
-    "datasource/get/1.0/"
+    "https://grupobmg.zeev.it/"
+    "api/internal/legacy/1.0/datasource/get/1.0/"
     "qw0Xk6xWKL563BI8VvBqJiKXDN4jyNDKsseOvLMXi1FEXDGwfsSSDRJdTRFco2SrBbrg3l33pGO3FkkeH5yEuw__"
 )
 COMPROVANTE_URL = "https://www.accesstage.com.br/apidoc/public/v1/comprovantes"
 
-# Em memória armazenamos o último PDF (só para demo; em produção use S3, BD, etc.)
-_last_pdf = None
-
 def get_token():
-    r = requests.get(TOKEN_URL, timeout=10)
-    r.raise_for_status()
-    return r.json()["success"][0]["cod"]
+    """Busca ou retorna do cache um token válido."""
+    if "token" in token_cache:
+        return token_cache["token"]
+    try:
+        resp = session.get(TOKEN_URL, timeout=30)
+        resp.raise_for_status()
+        body = resp.json()
+        token = body["success"][0]["cod"]
+        token_cache["token"] = token
+        return token
+    except Exception as e:
+        # dispara um erro controlado para ser capturado
+        raise RuntimeError(f"Não foi possível gerar token: {e}")
 
 @app.route("/comprovante", methods=["POST"])
-def comprovante():
-    global _last_pdf
-    body = request.get_json(force=True)
-
-    # --- 1) Normalizar os campos vindos do Zeev ---
-    # Exemplo de JSON bruto do Zeev:
-    # {
-    #   "tipoDePagamento": "20",
-    #   "codBan":         "341",
-    #   "numeroDoDocumento":"25D3000008DPM004502S",
-    #   "valorDoPagamento": "412,5",
-    #   "dataDoPagamento":  "07/04/2025"
-    # }
-
+def gerar_comprovante():
+    """
+    Espera JSON:
+    {
+      "tipoDePagamento": "20",
+      "codBan": "341",
+      "numeroDoDocumento": "...",
+      "valorDoPagamento": "412,5",
+      "dataDoPagamento": "07/04/2025"
+    }
+    Retorna:
+    - 200 + { Resultado, link }
+    - 4xx ou 5xx + { Resultado, motivo }
+    """
     try:
-        tipo =   body["tipoDePagamento"]
-        banco =  body["codBan"]
-        num   =  body["numeroDoDocumento"]
-        # 1a) converte "412,5" → "412.50"
-        valor = body["valorDoPagamento"].replace(".", "").replace(",", ".")
-        # 1b) converte "07/04/2025" → "2025-04-07"
-        data  = datetime.strptime(body["dataDoPagamento"], "%d/%m/%Y").date().isoformat()
-    except KeyError as e:
-        return jsonify(error=f"Campo obrigatório faltando: {e}"), 400
-    except ValueError as e:
-        return jsonify(error="Formato inválido em valor ou data", details=str(e)), 400
+        payload_in = request.get_json(force=True)
+    except:
+        return jsonify(Resultado="Erro", motivo="JSON inválido"), 400
 
-    # 2) Gera token e chama AccesStage
+    # 1) Obter token
     try:
         token = get_token()
-    except Exception as e:
-        return jsonify(error="Não foi possível gerar token", details=str(e)), 502
+    except RuntimeError as e:
+        return jsonify(Resultado="Erro", motivo=str(e)), 502
 
-    headers = {"token": token, "Content-Type": "application/json"}
-    payload = {
-        "tipoPagamento":      tipo,
-        "codigoBancoPagador": banco,
-        "numeroDocumento":    num,
-        "valorPagamento":     valor,
-        "dataPagamento":      data
-    }
-
+    # 2) Validar e converter campos
     try:
-        r = requests.post(COMPROVANTE_URL, json=payload, headers=headers, timeout=(5,30))
-        r.raise_for_status()
-        data_json = r.json()
-        if "pdf" not in data_json:
-            return jsonify(error="Resposta sem campo PDF"), 502
+        # data: dd/MM/yyyy -> yyyy-MM-dd
+        d, m, y = payload_in["dataDoPagamento"].split("/")
+        data_iso = f"{y}-{m.zfill(2)}-{d.zfill(2)}"
+        # valor: "1.234,56" -> "1234.56"
+        valor = payload_in["valorDoPagamento"].replace(".", "").replace(",", ".")
+        payload = {
+            "tipoPagamento": payload_in["tipoDePagamento"],
+            "codigoBancoPagador": payload_in["codBan"],
+            "numeroDocumento": payload_in["numeroDoDocumento"],
+            "valorPagamento": valor,
+            "dataPagamento": data_iso
+        }
+    except KeyError:
+        return jsonify(Resultado="Erro", motivo="Campo ausente"), 400
+    except Exception:
+        return jsonify(Resultado="Erro", motivo="Formato de data/valor inválido"), 400
 
-        # salva em memória para servir no download
-        _last_pdf = data_json["pdf"]
-        # gera a URL de download (rota /comprovante/download)
-        link = url_for("download_comprovante", _external=True)
-        return jsonify(pdfBase64=_last_pdf, pdfLink=link), 200
+    # 3) Chamar Accesstage
+    headers = {"token": token, "Content-Type": "application/json"}
+    try:
+        resp = session.post(COMPROVANTE_URL, json=payload, headers=headers, timeout=30)
 
-    except Timeout as e:
-        return jsonify(error="Timeout na API de comprovantes", details=str(e)), 504
-    except HTTPError as e:
-        return jsonify(
-            error="Erro na API de comprovantes",
-            details=e.response.text
-        ), r.status_code
+        if resp.status_code == 404:
+            return jsonify(Resultado="Erro", motivo="Comprovante não encontrado."), 404
+
+        resp.raise_for_status()
+        body = resp.json()
+
+        pdf_b64 = body.get("pdf")
+        if not pdf_b64:
+            # se a API vier sem pdf
+            raise ValueError("Resposta sem PDF em base64")
+
+        link = f"data:application/pdf;base64,{pdf_b64}"
+        return jsonify(Resultado="Comprovante encontrado", link=link), 200
+
+    except requests.HTTPError as e:
+        # 4xx / 5xx diferente de 404
+        return jsonify(Resultado="Erro", motivo=f"Erro na API de comprovantes: {e}"), 502
+
     except Exception as e:
-        return jsonify(error="Erro interno", details=str(e)), 500
-
-@app.route("/comprovante/download", methods=["GET"])
-def download_comprovante():
-    """
-    Retorna o PDF gerado na última chamada como um download.
-    Em produção, este endpoint deveria buscar por ID ou armazenar em S3/BD.
-    """
-    global _last_pdf
-    if not _last_pdf:
-        return "Nenhum comprovante gerado ainda.", 404
-
-    pdf_bytes = base64.b64decode(_last_pdf)
-    return Response(
-        pdf_bytes,
-        mimetype="application/pdf",
-        headers={"Content-Disposition": 'attachment; filename="comprovante.pdf"'}
-    )
+        # timeout, JSON inválido, etc.
+        return jsonify(Resultado="Erro", motivo=f"Falha inesperada: {e}"), 500
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    # no Render, o gunicorn executa; localmente basta:
+    app.run(host="0.0.0.0", port=5000, debug=False)
